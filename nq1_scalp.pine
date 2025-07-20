@@ -1,0 +1,265 @@
+import TradingView/Strategy/3
+
+//@version=6
+strategy(title = 'Enhanced NQ1 Scalping Strategy', shorttitle = 'NQ1 Scalping', overlay = true,default_qty_type=strategy.percent_of_equity,default_qty_value=100,initial_capital = 10000)
+buyAlertMessage = '{"ticker": "' + syminfo.ticker + '", "action": "buy", "price": ' + str.tostring(close) + '}'
+sellAlertMessage = '{"ticker": "' + syminfo.ticker + '", "action": "sell", "price": ' + str.tostring(close) + '}'
+
+// Input Parameters
+invertsignal = input.bool(true, "Invert Signal")
+nolowest = input.int(3, "X no of lowest volume in selected candles") - 1
+uplinec = input.color(color.red, "Resistance lines")
+uplinew = input.int(4, "Resistance Lines Width")
+dnlinec = input.color(color.green, "Support lines")
+dnlinew = input.int(4, "Support Lines Width")
+
+// Add missing strategy/indicator inputs
+strictEntry = input.bool(false, "Strict Entry (require extra price distance)")
+takeProfitPoints = input.int(400, "Take Profit (Points)", minval=10, maxval=1000)
+stopLossPoints = input.int(200, "Stop Loss (Points)", minval=10, maxval=500)
+
+// Filter Toggles
+useMinBarsFilter = input.bool(true, "Use Min Bars Between Trades")
+useCandleFilter = input.bool(true, "Use Candle Confirmation")
+
+// ATR Volatility Filter
+useATRFilter = input.bool(false, "Use ATR Volatility Filter")
+min_atr_percent = input.float(0.5, "Min ATR % of Price", step=0.1)
+atr_length = 14
+atr_val = ta.atr(atr_length)
+atr_ok = not useATRFilter or (atr_val / close * 100 >= min_atr_percent)
+
+// Two EMA Filter
+useTwoEMAFilter = input.bool(false, "Use Two EMA Filter")
+two_ema_length1 = input.int(8, "Two EMA Fast Length")
+two_ema_length2 = input.int(21, "Two EMA Slow Length")
+two_ema1 = ta.ema(close, two_ema_length1)
+two_ema2 = ta.ema(close, two_ema_length2)
+two_ema_long_ok = not useTwoEMAFilter or (two_ema1 > two_ema2)
+two_ema_short_ok = not useTwoEMAFilter or (two_ema1 < two_ema2)
+
+// Candle/Min Bars logic
+var int lastTradeBar = na
+minBarsBetweenTrades = 10
+canTrade = na(lastTradeBar) or (bar_index - lastTradeBar > minBarsBetweenTrades)
+candle_long_ok = not useCandleFilter or close > open
+candle_short_ok = not useCandleFilter or close < open
+can_trade_ok = not useMinBarsFilter or canTrade
+
+// Persistent arrays for storing lines and levels
+var line[] lines = array.new_line()
+var float[] supportLevels = array.new<float>()
+var float[] resistanceLevels = array.new<float>()
+var bool[] supportTraded = array.new<bool>()
+var bool[] resistanceTraded = array.new<bool>()
+var int lastCalculation = 0
+
+// Function to clean old lines
+cleanOldLines() =>
+    if array.size(lines) > 0
+        for i = 0 to array.size(lines) - 1
+            line.delete(array.get(lines, i))
+        array.clear(lines)
+
+// Volume Profile Calculations
+bbars = input.int(title='Number of Bars', defval=150, minval=1, maxval=500, group="Volume Profile")
+cnum = input.int(title='Row Size', defval=24, minval=5, maxval=100, group="Volume Profile")
+percent = input.float(70., title='Value Area Volume %', minval=0, maxval=100, group="Volume Profile")
+poc_color = input.color(defval=#ff0000, title='POC Color', inline='poc', group="Volume Profile")
+poc_width = input.int(defval=2, title='Width', minval=1, maxval=5, inline='poc', group="Volume Profile")
+vup_color = input(defval=color.new(color.blue, 30), title='Value Area Up', group="Volume Profile")
+vdown_color = input(defval=color.new(color.orange, 30), title='Value Area Down', group="Volume Profile")
+up_color = input(defval=color.new(color.blue, 75), title='UP Volume', group="Volume Profile")
+down_color = input(defval=color.new(color.orange, 75), title='Down Volume', group="Volume Profile")
+show_poc = input.bool(defval=false, title="Show POC Label", group="Volume Profile")
+
+top = ta.highest(bbars)
+bot = ta.lowest(bbars)
+dist = (top - bot) / 500
+step = (top - bot) / cnum
+levels = array.new_float(cnum + 1)
+for x = 0 to cnum by 1
+    array.set(levels, x, bot + step * x)
+
+get_vol(y11, y12, y21, y22, height, vol) =>
+    nz(math.max(math.min(math.max(y11, y12), math.max(y21, y22)) - math.max(math.min(y11, y12), math.min(y21, y22)), 0) * vol / height)
+run = true
+if run
+    cleanOldLines()
+    array.clear(supportLevels)
+    array.clear(resistanceLevels)
+    array.clear(supportTraded)
+    array.clear(resistanceTraded)
+    volumes = array.new_float(cnum * 2, 0.)
+    for bars = 0 to math.min(bbars - 1, bar_index) by 1
+        if bar_index >= bars
+            body_top = math.max(close[bars], open[bars])
+            body_bot = math.min(close[bars], open[bars])
+            itsgreen = close[bars] >= open[bars]
+            topwick = high[bars] - body_top
+            bottomwick = body_bot - low[bars]
+            body = body_top - body_bot
+            total_height = 2 * topwick + 2 * bottomwick + body
+            bodyvol = total_height > 0 ? body * volume[bars] / total_height : 0
+            topwickvol = total_height > 0 ? 2 * topwick * volume[bars] / total_height : 0
+            bottomwickvol = total_height > 0 ? 2 * bottomwick * volume[bars] / total_height : 0
+            for x = 0 to cnum - 1 by 1
+                array.set(volumes, x, array.get(volumes, x) + (itsgreen ? get_vol(array.get(levels, x), array.get(levels, x + 1), body_bot, body_top, body, bodyvol) : 0) + get_vol(array.get(levels, x), array.get(levels, x + 1), body_top, high[bars], topwick, topwickvol) / 2 + get_vol(array.get(levels, x), array.get(levels, x + 1), body_bot, low[bars], bottomwick, bottomwickvol) / 2)
+                array.set(volumes, x + cnum, array.get(volumes, x + cnum) + (itsgreen ? 0 : get_vol(array.get(levels, x), array.get(levels, x + 1), body_bot, body_top, body, bodyvol)) + get_vol(array.get(levels, x), array.get(levels, x + 1), body_top, high[bars], topwick, topwickvol) / 2 + get_vol(array.get(levels, x), array.get(levels, x + 1), body_bot, low[bars], bottomwick, bottomwickvol) / 2)
+    totalvols = array.new_float(cnum, 0.)
+    for x = 0 to cnum - 1 by 1
+        array.set(totalvols, x, array.get(volumes, x) + array.get(volumes, x + cnum))
+    maxVol = array.max(totalvols)
+    int poc = array.indexof(totalvols, maxVol)
+    totalmax = array.sum(totalvols) * percent / 100.
+    va_total = array.get(totalvols, poc)
+    int up = poc
+    int down = poc
+    for x = 0 to cnum - 1 by 1
+        if va_total >= totalmax
+            break
+        uppervol = up < cnum - 1 ? array.get(totalvols, up + 1) : 0.
+        lowervol = down > 0 ? array.get(totalvols, down - 1) : 0.
+        if uppervol == 0 and lowervol == 0
+            break
+        if uppervol >= lowervol
+            va_total += uppervol
+            up += 1
+        else
+            va_total += lowervol
+            down -= 1
+    if maxVol > 0
+        for x = 0 to cnum * 2 - 1 by 1
+            array.set(volumes, x, array.get(volumes, x) * bbars / (3 * maxVol))
+    vol_p = array.new_float()
+    vol_l = array.new_float()
+    vol_p2 = array.new_float()
+    vol_l2 = array.new_float()
+    poc_level = (array.get(levels, poc) + array.get(levels, poc + 1)) / 2
+    for x = 0 to cnum - 1 by 1
+        level_top = array.get(levels, x + 1) - dist
+        level_bottom = array.get(levels, x) + dist
+        vol_width = math.round(array.get(volumes, x))
+        vol_width_down = math.round(array.get(volumes, x + cnum))
+        box.new(bar_index - bbars + 1, level_top, bar_index - bbars + 1 + vol_width, level_bottom, border_width=0, bgcolor=x >= down and x <= up ? vup_color : up_color)
+        box.new(bar_index - bbars + 1 + vol_width, level_top, bar_index - bbars + 1 + vol_width + vol_width_down, level_bottom, border_width=0, bgcolor=x >= down and x <= up ? vdown_color : down_color)
+        if level_top > poc_level
+            array.push(vol_p, bar_index - bbars + 1 + vol_width + vol_width_down)
+            array.push(vol_l, level_top)
+        if level_top < poc_level
+            array.push(vol_p2, bar_index - bbars + 1 + vol_width + vol_width_down)
+            array.push(vol_l2, level_top)
+    if array.size(vol_p) > 0 and array.size(vol_l) > 0
+        y2 = array.sort_indices(vol_p)
+        if array.size(y2) > 0
+            maxIterations = math.min(nolowest, math.min(array.size(y2) - 1, array.size(vol_l) - 1))
+            for i = 0 to maxIterations
+                if i < array.size(y2) and array.get(y2, i) < array.size(vol_l)
+                    resistanceLevel = array.get(vol_l, array.get(y2, i))
+                    if not na(resistanceLevel)
+                        l2 = line.new(bar_index - bbars + 1, resistanceLevel, bar_index + 50, resistanceLevel, extend=extend.right, color=uplinec, width=uplinew)
+                        array.push(lines, l2)
+                        array.push(resistanceLevels, resistanceLevel)
+                        array.push(resistanceTraded, false)
+    if array.size(vol_p2) > 0 and array.size(vol_l2) > 0
+        y3 = array.sort_indices(vol_p2)
+        if array.size(y3) > 0
+            maxIterations = math.min(nolowest, math.min(array.size(y3) - 1, array.size(vol_l2) - 1))
+            for i = 0 to maxIterations
+                if i < array.size(y3) and array.get(y3, i) < array.size(vol_l2)
+                    supportLevel = array.get(vol_l2, array.get(y3, i))
+                    if not na(supportLevel)
+                        l22 = line.new(bar_index - bbars + 1, supportLevel, bar_index + 50, supportLevel, extend=extend.right, color=dnlinec, width=dnlinew)
+                        array.push(lines, l22)
+                        array.push(supportLevels, supportLevel)
+                        array.push(supportTraded, false)
+    if not na(poc_level)
+        poc_line = line.new(bar_index - bbars + 1, poc_level, bar_index + 20, poc_level, extend=extend.right, color=poc_color, width=poc_width)
+        array.push(lines, poc_line)
+        if show_poc
+            label.new(bar_index + 15, poc_level, text="POC: " + str.tostring(math.round_to_mintick(poc_level)), style=close >= poc_level ? label.style_label_up : label.style_label_down, color=poc_color, textcolor=color.white)
+
+// --- TP/SL Plotting Series ---
+var float longTP = na
+var float longSL = na
+var float shortTP = na
+var float shortSL = na
+
+// --- Global smart confirmation signals ---
+var bool validLongSignal = false
+var bool validShortSignal = false
+
+// --- Reset signals at the start of each bar ---
+validLongSignal := false
+validShortSignal := false
+
+// Signal logic (no trading, just visual signals)
+// Long signals at support levels
+if array.size(supportLevels) > 0 and barstate.isconfirmed
+    for i = 0 to array.size(supportLevels) - 1
+        if (i < array.size(supportLevels)) and (i < array.size(supportTraded))
+            supportLevel = array.get(supportLevels, i)
+            alreadyTraded = array.get(supportTraded, i)
+            // Reset all TP/SL series to na at the start of each bar
+            longTP := na
+            longSL := na
+            shortTP := na
+            shortSL := na
+            validLong = not alreadyTraded and not na(supportLevel) and low <= supportLevel + syminfo.mintick * 3 and (strictEntry ? close > supportLevel + syminfo.mintick * 3 : close > supportLevel) and candle_long_ok and can_trade_ok and atr_ok and two_ema_long_ok
+            if validLong
+                validLongSignal := true
+                label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+                longTP := close + (takeProfitPoints * syminfo.mintick)
+                longSL := close - (stopLossPoints * syminfo.mintick)
+                alert(buyAlertMessage, alert.freq_once_per_bar)
+
+                lastTradeBar := bar_index
+            else if invertsignal and not alreadyTraded and not na(supportLevel) and low <= supportLevel + syminfo.mintick * 3 and (strictEntry ? close > supportLevel + syminfo.mintick * 3 : close > supportLevel) and candle_long_ok and can_trade_ok and atr_ok and two_ema_short_ok //and barstate.isconfirmed
+                label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+                shortTP := close - (takeProfitPoints * syminfo.mintick)
+                shortSL := close + (stopLossPoints * syminfo.mintick)
+                alert(sellAlertMessage, alert.freq_once_per_bar)    
+
+                lastTradeBar := bar_index
+
+// Short signals at resistance levels
+if array.size(resistanceLevels) > 0 and barstate.isconfirmed
+    for i = 0 to array.size(resistanceLevels) - 1
+        if (i < array.size(resistanceLevels)) and (i < array.size(resistanceTraded))
+            resistanceLevel = array.get(resistanceLevels, i)
+            alreadyTraded = array.get(resistanceTraded, i)
+            // Reset all TP/SL series to na at the start of each bar
+            longTP := na
+            longSL := na
+            shortTP := na
+            shortSL := na
+            validShort = not alreadyTraded and not na(resistanceLevel) and high >= resistanceLevel - syminfo.mintick * 3 and (strictEntry ? close < resistanceLevel - syminfo.mintick * 3 : close < resistanceLevel) and candle_short_ok and can_trade_ok and atr_ok and two_ema_short_ok
+            if validShort
+                validShortSignal := true
+                label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.red, textcolor=color.white, size=size.small)
+                shortTP := close - (takeProfitPoints * syminfo.mintick)
+                shortSL := close + (stopLossPoints * syminfo.mintick)
+                alert(sellAlertMessage, alert.freq_once_per_bar)    
+
+                lastTradeBar := bar_index
+            else if invertsignal and not alreadyTraded and not na(resistanceLevel) and high >= resistanceLevel - syminfo.mintick * 3 and (strictEntry ? close < resistanceLevel - syminfo.mintick * 3 : close < resistanceLevel) and candle_short_ok and can_trade_ok and atr_ok and two_ema_long_ok //and barstate.isconfirmed
+                label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.green, textcolor=color.white, size=size.small)
+                longTP := close + (takeProfitPoints * syminfo.mintick)
+                alert(buyAlertMessage, alert.freq_once_per_bar)
+
+                longSL := close - (stopLossPoints * syminfo.mintick)
+                lastTradeBar := bar_index
+
+// --- Plot TP/SL at global scope ---
+plotshape(longTP, title="Long TP", style=shape.triangleup, location=location.absolute, color=color.green, size=size.tiny, offset=0)
+plotshape(longSL, title="Long SL", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny, offset=0)
+plotshape(shortTP, title="Short TP", style=shape.triangledown, location=location.absolute, color=color.green, size=size.tiny, offset=0)
+plotshape(shortSL, title="Short SL", style=shape.triangleup, location=location.absolute, color=color.red, size=size.tiny, offset=0) 
+
+// === SMART CONFIRMATION VISUALS ===
+// Smart confirmation: plot yellow arrow only when a trade signal is generated
+displayLongArrow = validLongSignal and barstate.isconfirmed
+plotshape(displayLongArrow, title="Smart Long Confirmation", location=location.belowbar, style=shape.arrowup, color=color.yellow, size=size.small, offset=0)
+displayShortArrow = validShortSignal and barstate.isconfirmed
+plotshape(displayShortArrow, title="Smart Short Confirmation", location=location.abovebar, style=shape.arrowdown, color=color.yellow, size=size.small, offset=0) 
+
