@@ -4,7 +4,7 @@ import TradingView/Strategy/3
 strategy(title = 'Enhanced NQ1 Scalping Strategy', shorttitle = 'NQ1 Scalping', overlay = true,default_qty_type=strategy.percent_of_equity,default_qty_value=100,initial_capital = 10000)
 buyAlertMessage = '{"ticker": "' + syminfo.ticker + '", "action": "buy", "price": ' + str.tostring(close) + '}'
 sellAlertMessage = '{"ticker": "' + syminfo.ticker + '", "action": "sell", "price": ' + str.tostring(close) + '}'
-
+//
 // Input Parameters
 invertsignal = input.bool(true, "Invert Signal")
 nolowest = input.int(3, "X no of lowest volume in selected candles") - 1
